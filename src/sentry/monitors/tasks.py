@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from urllib.parse import urlencode
 
 import msgpack
 import sentry_sdk
@@ -18,6 +20,7 @@ from sentry import features
 from sentry.conf.types.kafka_definition import Topic
 from sentry.constants import ObjectStatus
 from sentry.models.organization import Organization
+from sentry.models.project import Project
 from sentry.monitors.logic.mark_failed import mark_failed
 from sentry.monitors.schedule import get_prev_schedule
 from sentry.monitors.types import ClockPulseMessage
@@ -25,6 +28,7 @@ from sentry.silo import SiloMode
 from sentry.tasks.base import instrumented_task
 from sentry.utils import metrics, redis
 from sentry.utils.arroyo_producer import SingletonProducer
+from sentry.utils.email import MessageBuilder
 from sentry.utils.kafka_config import (
     get_kafka_admin_cluster_options,
     get_kafka_producer_cluster_options,
@@ -413,6 +417,21 @@ def mark_checkin_timeout(checkin_id: int, ts: datetime, **kwargs):
         mark_failed(checkin, ts=most_recent_expected_ts)
 
 
+MAX_ENVIRONMENTS_IN_MONITOR_LINK = 10
+
+
+def generate_monitor_overview_url(organization: Organization):
+    return f"https://{organization.slug}.sentry.io/crons"
+
+
+def generate_monitor_detail_url(
+    organization: Organization, project: Project, monitor_slug: str, environments: list[str]
+):
+    env_query = urlencode({"environment": environments}, doseq=True)
+    monitors_url = generate_monitor_overview_url(organization)
+    return f"{monitors_url}/{project.slug}/{monitor_slug}/?{env_query}"
+
+
 @instrumented_task(
     name="sentry.monitors.tasks.detect_broken_monitor_envs",
     max_retries=0,
@@ -428,18 +447,16 @@ def detect_broken_monitor_envs():
         monitor__status=ObjectStatus.ACTIVE,
         monitor__is_muted=False,
         monitor_environment__is_muted=False,
-        # TODO(davidenwang): When we want to email users, remove this filter
-        monitorenvbrokendetection__isnull=True,
+        # TODO(davidenwang): Once we start disabling environments, change accordingly
+        monitorenvbrokendetection__user_notified_timestamp=None,
     )
-    for open_incident in RangeQuerySetWrapper(
-        open_incidents_qs,
-        order_by="starting_timestamp",
-        step=1000,
-    ):
+    org_ids_with_open_incidents = (
+        open_incidents_qs.all().values_list("monitor__organization_id", flat=True).distinct()
+    )
+
+    for org_id in org_ids_with_open_incidents:
         try:
-            organization = Organization.objects.get_from_cache(
-                id=open_incident.monitor.organization_id
-            )
+            organization = Organization.objects.get_from_cache(id=org_id)
             if not features.has(
                 "organizations:crons-broken-monitor-detection", organization=organization
             ):
@@ -447,21 +464,87 @@ def detect_broken_monitor_envs():
         except Organization.DoesNotExist:
             continue
 
-        # verify that the most recent check-ins have been failing
-        recent_checkins = (
-            MonitorCheckIn.objects.filter(monitor_environment=open_incident.monitor_environment)
-            .order_by("-date_added")
-            .values("status")[:NUM_CONSECUTIVE_BROKEN_CHECKINS]
+        # Map user email to a dictionary of monitors and their earliest incident start date amongst its broken environments
+        user_broken_envs = defaultdict(
+            lambda: defaultdict(
+                lambda: {"environment_names": [], "earliest_start": django_timezone.now()}
+            )
         )
-        if len(recent_checkins) != NUM_CONSECUTIVE_BROKEN_CHECKINS or not all(
-            checkin["status"] in [CheckInStatus.ERROR, CheckInStatus.TIMEOUT, CheckInStatus.MISSED]
-            for checkin in recent_checkins
+        orgs_open_incidents = (
+            open_incidents_qs.all()
+            .select_related("monitor_environment")
+            .filter(monitor__organization_id=org_id)
+        )
+        # Query for all the broken incidents within the current org we are processing
+        for open_incident in RangeQuerySetWrapper(
+            orgs_open_incidents,
+            order_by="starting_timestamp",
+            step=1000,
         ):
-            continue
+            # Verify that the most recent check-ins have been failing
+            recent_checkins = (
+                MonitorCheckIn.objects.filter(monitor_environment=open_incident.monitor_environment)
+                .order_by("-date_added")
+                .values("status")[:NUM_CONSECUTIVE_BROKEN_CHECKINS]
+            )
+            if len(recent_checkins) != NUM_CONSECUTIVE_BROKEN_CHECKINS or not all(
+                checkin["status"]
+                in [CheckInStatus.ERROR, CheckInStatus.TIMEOUT, CheckInStatus.MISSED]
+                for checkin in recent_checkins
+            ):
+                continue
 
-        detection, _ = MonitorEnvBrokenDetection.objects.get_or_create(
-            monitor_incident=open_incident, defaults={"detection_timestamp": current_time}
-        )
-        if not detection.user_notified_timestamp:
-            # TODO(davidenwang): This is where we would implement email sending logic
-            pass
+            detection, _ = MonitorEnvBrokenDetection.objects.get_or_create(
+                monitor_incident=open_incident, defaults={"detection_timestamp": current_time}
+            )
+            if not detection.user_notified_timestamp:
+                environment_name = open_incident.monitor_environment.get_environment().name
+                project = Project.objects.get_from_cache(id=open_incident.monitor.project_id)
+                for user in project.member_set:
+                    if not user.user_email:
+                        continue
+
+                    user_monitor_entry = user_broken_envs[user.user_email][
+                        open_incident.monitor.slug
+                    ]
+                    user_monitor_entry["earliest_start"] = min(
+                        open_incident.starting_timestamp,
+                        user_monitor_entry["earliest_start"],
+                    )
+                    user_monitor_entry["project_slug"] = project.slug
+                    if (
+                        len(user_monitor_entry["environment_names"])
+                        < MAX_ENVIRONMENTS_IN_MONITOR_LINK
+                    ):
+                        user_monitor_entry["environment_names"].append(environment_name)
+
+        # After accumulating all users within the org and which monitors to email them, send the emails
+        for user_email, broken_monitors in user_broken_envs.items():
+            broken_monitors_context = [
+                (
+                    monitor_slug,
+                    generate_monitor_detail_url(
+                        organization, project, monitor_slug, monitor_entry["environment_names"]
+                    ),
+                    monitor_entry["earliest_start"],
+                )
+                for monitor_slug, monitor_entry in broken_monitors.items()
+            ]
+
+            context = {
+                "broken_monitors": broken_monitors_context,
+                "view_monitors_link": generate_monitor_overview_url(organization),
+            }
+            message = MessageBuilder(
+                subject="Your monitors are broken!",
+                template="sentry/emails/crons/broken-monitors.txt",
+                html_template="sentry/emails/crons/broken-monitors.html",
+                type="crons.broken_monitors",
+                context=context,
+            )
+            message.send_async([user_email])
+
+        # mark all open detections for this org as having had their email sent
+        MonitorEnvBrokenDetection.objects.filter(
+            monitor_incident__in=orgs_open_incidents, user_notified_timestamp=None
+        ).update(user_notified_timestamp=django_timezone.now())

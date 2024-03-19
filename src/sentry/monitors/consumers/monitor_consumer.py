@@ -251,7 +251,22 @@ def update_existing_check_in(
         )
         return
 
-    if existing_check_in.status in CheckInStatus.FINISHED_VALUES:
+    # Check-in has already reached a user terminal status sent by a previous
+    # closing check-in.
+    already_user_complete = existing_check_in.status in CheckInStatus.USER_TERMINAL_VALUES
+
+    # Check-in has reached a synthetic terminal status and the updating
+    # check-in is attempting to re-open the already completed check-in.
+    #
+    # XXX(epurkhiser): This check allows synthetically completed check-ins
+    # (like timeouts) to be updated by a user complete check-in. See the later
+    # logic for how existing TIMEOUT check-ins are handled.
+    invalid_status_transition = (
+        existing_check_in.status in CheckInStatus.SYNTHETIC_TERMINAL_VALUES
+        and updated_status not in CheckInStatus.USER_TERMINAL_VALUES
+    )
+
+    if already_user_complete or invalid_status_transition:
         metrics.incr(
             "monitors.checkin.result",
             tags={**metric_kwargs, "status": "checkin_finished"},
@@ -293,21 +308,34 @@ def update_existing_check_in(
         )
         return
 
-    # update date_added for heartbeat
-    date_updated = existing_check_in.date_updated
-    if updated_status == CheckInStatus.IN_PROGRESS:
-        date_updated = start_time
+    updated_checkin = {
+        "status": updated_status,
+        "duration": updated_duration,
+    }
 
-    updated_timeout_at = get_new_timeout_at(existing_check_in, updated_status, start_time)
+    # XXX(epurkhiser): We currently allow a existing timed-out check-in to
+    # have it's duration updated. This helps users understand that a check-in
+    # DID complete. However we will NOT currently transition the status away
+    # from TIMEOUT.
+    #
+    # In the future we will likely revisit this by adding as `substatus` to
+    # check-ins which can help in the scenario where a TIMEOUT check-in
+    # transitions to a USER_TERMINAL_VALUES late value.
+    if existing_check_in.status == CheckInStatus.TIMEOUT:
+        del updated_checkin["status"]
 
-    existing_check_in.update(
-        status=updated_status,
-        duration=updated_duration,
-        date_updated=date_updated,
-        timeout_at=updated_timeout_at,
+    # IN_PROGRESS heartbeats bump the timeout
+    updated_checkin["timeout_at"] = get_new_timeout_at(
+        existing_check_in,
+        updated_status,
+        start_time,
     )
 
-    return
+    # IN_PROGRESS heartbeats bump the date_updated
+    if updated_status == CheckInStatus.IN_PROGRESS:
+        updated_checkin["date_updated"] = start_time
+
+    existing_check_in.update(**updated_checkin)
 
 
 def _process_checkin(item: CheckinItem, txn: Transaction | Span):
